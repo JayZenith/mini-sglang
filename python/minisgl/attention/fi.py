@@ -90,6 +90,8 @@ class FlashInferBackend(BaseAttnBackend):
         kvcache: BaseKVCache,
         page_table: torch.Tensor,
     ) -> None:
+        if getattr(config, "sliding_window", None):
+            logger.warning("Mistral sliding window detected but not supported in fi.py. Defaulting to full attention.")
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
             BatchPrefillWithPagedKVCacheWrapper,
