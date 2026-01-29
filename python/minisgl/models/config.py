@@ -43,6 +43,7 @@ class ModelConfig:
 
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
+            print("Head Dimension:", head_dim)
             head_dim = hidden_size // num_qo_heads
 
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
