@@ -275,7 +275,7 @@ For reproducibility:
 
 ```
 GPU: NVIDIA H100 80GB HBM3 (SM90)
-Python: 3.12.3
+Python: 3.11+
 PyTorch: 2.9.1+cu128
 CUDA: 12.8
 cuDNN: 91002
