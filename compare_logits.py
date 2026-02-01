@@ -1,19 +1,15 @@
 """
-Comprehensive benchmark: mini-sglang vs HuggingFace (Mistral-7B-v0.1)
+Validate mini-sglang vs HuggingFace (Mistral-7B-v0.1)
 
-This benchmark validates EVERYTHING from the blog:
 1. Short sequences: Numerical consistency within tolerance
-2. Long sequences: Sliding window behavioral verification  
-3. Performance: Latency, throughput, memory at various sequence lengths
+2. Long sequences: Sliding window behavioral verification (divergence test)
 
 Usage:
-  python compare_logits.py --hf         # Phase 1: Generate HF reference
-  python compare_logits.py --engine     # Phase 2: Engine comparison + sliding window test
-  python compare_logits.py --perf       # Phase 3: Performance benchmarks
-  python compare_logits.py --all        # Run all phases
+  python compare_logits.py --hf       # Phase 1: Generate HF reference
+  python compare_logits.py --engine   # Phase 2: Engine comparison + sliding window test
 """
 
-import sys, os, torch, argparse, gc, time
+import sys, os, torch, argparse, gc
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_dir, "python"))
@@ -32,11 +28,6 @@ TEST_PROMPTS = [
     "def fibonacci(n):",
     "The quick brown fox",
 ]
-
-# Performance benchmark sequence lengths
-PERF_SEQ_LENS = [512, 1024, 2048, 4096]
-WARMUP_ITERS = 3
-BENCH_ITERS = 10
 
 
 def run_phase_1_hf():
@@ -73,13 +64,6 @@ def run_phase_1_hf():
                 "text": text,
                 "type": "short"
             })
-            
-            probs = torch.softmax(logits[0], dim=-1)
-            top_probs, top_ids = torch.topk(probs, 5)
-            print("Top-5 predictions:")
-            for i, (p, idx) in enumerate(zip(top_probs, top_ids)):
-                token = tokenizer.decode([idx])
-                print(f"  {i+1}. '{token}' (prob={p.item():.4f})")
     
     # Long sequence test (beyond sliding window - 6000+ tokens)
     print("\n--- Long Sequence Test (beyond 4096 window) ---")
@@ -98,19 +82,11 @@ def run_phase_1_hf():
             "text": f"[Long sequence: {long_seq_len} tokens]",
             "type": "long"
         })
-        
-        probs = torch.softmax(long_logits[0], dim=-1)
-        top_probs, top_ids = torch.topk(probs, 5)
-        print("Top-5 predictions:")
-        for i, (p, idx) in enumerate(zip(top_probs, top_ids)):
-            token = tokenizer.decode([idx])
-            print(f"  {i+1}. '{token}' (prob={p.item():.4f})")
     
     torch.save(reference_data, TMP_FILE)
     print(f"\n" + "=" * 60)
     print(f"Saved {len(reference_data)} reference samples to {TMP_FILE}")
     print("Now run with --engine flag")
-
 
 def load_weights_efficient(model_path, device, dtype):
     """Load weights efficiently to minimize peak memory."""
@@ -136,7 +112,6 @@ def load_weights_efficient(model_path, device, dtype):
                 del tensor
     
     return state_dict
-
 
 def merge_weights(state_dict):
     """Merge QKV and gate/up projections."""
@@ -187,7 +162,7 @@ def setup_engine(model_config, device, dtype, max_seq_len, backend="fa", sliding
     from minisgl.attention import create_attention_backend
     from minisgl.kvcache import create_kvcache
     from minisgl.core import Context
-    from minisgl.models.config import ModelConfig, RotaryConfig
+    from minisgl.models.config import ModelConfig
     
     # Determine effective sliding window
     if sliding_window_setting == DISABLE_SLIDING_WINDOW:
@@ -422,18 +397,14 @@ def run_phase_2_engine():
         ctx_windowed, attn_windowed, _, page_table_windowed = setup_engine(
             model_config, device, dtype, long_seq_len + 10, backend="fa", sliding_window_setting=SLIDING_WINDOW
         )
-        torch.cuda.reset_peak_memory_stats()
         eng_windowed_logits = run_inference(model, long_tokens, ctx_windowed, attn_windowed, page_table_windowed, device)
-        windowed_mem = torch.cuda.max_memory_allocated() / 1e9
-        
+
         # Run with sliding window DISABLED (full attention)
         print("\n--- Running with Sliding Window DISABLED (full attention) ---")
         ctx_full, attn_full, _, page_table_full = setup_engine(
             model_config, device, dtype, long_seq_len + 10, backend="fa", sliding_window_setting=DISABLE_SLIDING_WINDOW
         )
-        torch.cuda.reset_peak_memory_stats()
         eng_full_logits = run_inference(model, long_tokens, ctx_full, attn_full, page_table_full, device)
-        full_mem = torch.cuda.max_memory_allocated() / 1e9
         
         # Comparisons
         windowed_vs_hf = torch.abs(hf_long_logits - eng_windowed_logits)
@@ -465,11 +436,7 @@ def run_phase_2_engine():
         print(f"\n--- Windowed vs Full Attention (DIVERGENCE TEST) ---")
         print(f"  Max Diff:  {max_diff_windowed_full:.6f}")
         print(f"  Top-1 Match: {windowed_top1 == full_top1}")
-        
-        print(f"\n--- Memory Usage ---")
-        print(f"  Windowed: {windowed_mem:.2f} GB")
-        print(f"  Full Attention: {full_mem:.2f} GB")
-        
+
         # Behavioral verification
         print("\n--- BEHAVIORAL VERIFICATION ---")
         
@@ -512,145 +479,17 @@ def run_phase_2_engine():
         print("[WARN] Sliding window behavioral verification inconclusive")
 
 
-def run_phase_3_perf():
-    """Phase 3: Performance benchmarks (latency, throughput, memory)."""
-    print("=" * 60)
-    print("Phase 3: Performance Benchmarks")
-    print("=" * 60)
-    
-    import minisgl.core as core_module
-    from minisgl.core import Batch, Req, SamplingParams
-    
-    device = torch.device("cuda:0")
-    dtype = torch.float16
-    
-    model, model_config = load_model_for_engine(device, dtype)
-    
-    print("\n" + "=" * 60)
-    print("Hardware & Configuration")
-    print("=" * 60)
-    
-    # Get GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    print(f"GPU: {gpu_name}")
-    print(f"Precision: FP16")
-    print(f"Backend: FlashAttention-3 (sgl-kernel)")
-    print(f"Sliding Window: {SLIDING_WINDOW} tokens (ACTIVE)")
-    print(f"Batch Size: 1 (single request)")
-    print(f"Phase: Prefill only")
-    print(f"Warmup: {WARMUP_ITERS} iterations")
-    print(f"Benchmark: {BENCH_ITERS} iterations")
-    
-    print("\n" + "=" * 60)
-    print("Prefill Performance")
-    print("=" * 60)
-    print(f"{'Seq Len':>8} | {'Latency (ms)':>12} | {'Throughput (tok/s)':>18} | {'Peak Mem (GB)':>13}")
-    print("-" * 9 + "|" + "-" * 14 + "|" + "-" * 20 + "|" + "-" * 15)
-    
-    results = []
-    
-    for seq_len in PERF_SEQ_LENS:
-        # Create dummy tokens
-        tokens = torch.randint(1, 30000, (seq_len,), dtype=torch.int32)
-        
-        # Setup engine for this sequence length
-        ctx, attn_backend, kv_cache, page_table = setup_engine(
-            model_config, device, dtype, seq_len + 10, backend="fa", sliding_window_setting=SLIDING_WINDOW
-        )
-        
-        # Create batch
-        req = Req(
-            input_ids=tokens,
-            table_idx=0,
-            cached_len=0,
-            output_len=1,
-            uid=0,
-            sampling_params=SamplingParams(max_tokens=1),
-            cache_handle=None,
-        )
-        
-        batch = Batch(reqs=[req], phase="prefill")
-        batch.input_ids = tokens.to(device)
-        batch.out_loc = torch.arange(seq_len, device=device)
-        batch.padded_reqs = [req]
-        page_table[0, :seq_len] = torch.arange(seq_len, device=device)
-        
-        # Set global context
-        core_module._GLOBAL_CTX = ctx
-        
-        # Warmup
-        for _ in range(WARMUP_ITERS):
-            with torch.no_grad():
-                with ctx.forward_batch(batch):
-                    attn_backend.prepare_metadata(batch)
-                    _ = model.forward()
-            torch.cuda.synchronize()
-        
-        # Reset memory stats
-        torch.cuda.reset_peak_memory_stats()
-        
-        # Benchmark
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        
-        for _ in range(BENCH_ITERS):
-            with torch.no_grad():
-                with ctx.forward_batch(batch):
-                    attn_backend.prepare_metadata(batch)
-                    _ = model.forward()
-            torch.cuda.synchronize()
-        
-        end = time.perf_counter()
-        
-        # Calculate metrics
-        total_time = end - start
-        avg_latency_ms = (total_time / BENCH_ITERS) * 1000
-        throughput = seq_len / (avg_latency_ms / 1000)
-        peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
-        
-        results.append({
-            "seq_len": seq_len,
-            "latency_ms": avg_latency_ms,
-            "throughput": throughput,
-            "peak_mem_gb": peak_mem_gb,
-        })
-        
-        print(f"{seq_len:>8} | {avg_latency_ms:>12.2f} | {throughput:>18,.0f} | {peak_mem_gb:>13.2f}")
-        
-        # Cleanup
-        core_module._GLOBAL_CTX = None
-        del ctx, attn_backend, kv_cache, page_table, batch, req
-        gc.collect()
-        torch.cuda.empty_cache()
-    
-    print("\nNote: Throughput is tokens/sec per request (not aggregate).")
-    
-    return results
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Comprehensive benchmark: mini-sglang vs HuggingFace")
+    parser = argparse.ArgumentParser(description="Validate mini-sglang vs HuggingFace")
     parser.add_argument("--hf", action="store_true", help="Phase 1: Generate HuggingFace reference")
     parser.add_argument("--engine", action="store_true", help="Phase 2: Engine comparison + sliding window test")
-    parser.add_argument("--perf", action="store_true", help="Phase 3: Performance benchmarks")
-    parser.add_argument("--all", action="store_true", help="Run all phases")
     args = parser.parse_args()
-    
-    if args.all:
-        run_phase_1_hf()
-        print("\n" + "#" * 60 + "\n")
-        run_phase_2_engine()
-        print("\n" + "#" * 60 + "\n")
-        run_phase_3_perf()
-    elif args.hf:
+
+    if args.hf:
         run_phase_1_hf()
     elif args.engine:
         run_phase_2_engine()
-    elif args.perf:
-        run_phase_3_perf()
     else:
         print("Usage:")
         print("  python compare_logits.py --hf       # Phase 1: Generate HF reference")
         print("  python compare_logits.py --engine   # Phase 2: Engine comparison + sliding window")
-        print("  python compare_logits.py --perf     # Phase 3: Performance benchmarks")
-        print("  python compare_logits.py --all      # Run all phases")
